@@ -1,0 +1,90 @@
+name: Azazel Auto Build APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'flutter or native'
+        required: true
+        default: 'flutter'
+      build_mode:
+        description: 'release or debug'
+        required: true
+        default: 'release'
+      source_url:
+        description: 'Direct URL to source zip'
+        required: true
+      app_name:
+        description: 'Output APK name'
+        required: true
+        default: 'azazel_build'
+      release_tag:
+        description: 'GitHub Release tag for artifact upload'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Worker Repo
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Flutter (if flutter)
+        if: inputs.build_type == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: Download & Extract Source ZIP
+        run: |
+          mkdir -p workspace source_extracted
+          curl -L -sS "${{ inputs.source_url }}" -o workspace/source.zip
+          unzip -q workspace/source.zip -d source_extracted
+          PROJECT_DIR=$(find source_extracted -maxdepth 3 \( -name "pubspec.yaml" -o -name "build.gradle" -o -name "build.gradle.kts" \) | head -n 1 | xargs dirname)
+          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
+
+      - name: Build Flutter APK
+        if: inputs.build_type == 'flutter'
+        run: |
+          cd "$PROJECT_DIR"
+          flutter pub get
+          if [ "${{ inputs.build_mode }}" = "release" ]; then
+            flutter build apk --release --no-tree-shake-icons
+            APK_PATH=$(find build/app/outputs/flutter-apk -name "app-release.apk" | head -n 1)
+          else
+            flutter build apk --debug
+            APK_PATH=$(find build/app/outputs/flutter-apk -name "app-debug.apk" | head -n 1)
+          fi
+          cp "$APK_PATH" "$GITHUB_WORKSPACE/workspace/${{ inputs.app_name }}.apk"
+
+      - name: Build Native Java/Kotlin APK
+        if: inputs.build_type == 'native'
+        run: |
+          cd "$PROJECT_DIR"
+          chmod +x ./gradlew || gradle wrapper
+          if [ "${{ inputs.build_mode }}" = "release" ]; then
+            ./gradlew assembleRelease --no-daemon
+            APK_PATH=$(find . -path "*/outputs/apk/release/*.apk" | head -n 1)
+          else
+            ./gradlew assembleDebug --no-daemon
+            APK_PATH=$(find . -path "*/outputs/apk/debug/*.apk" | head -n 1)
+          fi
+          cp "$APK_PATH" "$GITHUB_WORKSPACE/workspace/${{ inputs.app_name }}.apk"
+
+      - name: Upload APK to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          files: workspace/${{ inputs.app_name }}.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
