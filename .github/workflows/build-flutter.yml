@@ -1,0 +1,209 @@
+name: Build Flutter APK
+run-name: Build ${{ github.event.inputs.jobId }}
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: 'Job ID from bot'
+        required: true
+      userId:
+        description: 'User ID'
+        required: false
+        default: '0'
+      payload:
+        description: 'Build payload (JSON)'
+        required: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+      - name: Prepare project
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PAYLOAD: ${{ github.event.inputs.payload }}
+        run: |
+          set -e
+          printf '%s' "$PAYLOAD" > payload.json
+          ASSET_URL=$(jq -r '.url // empty' payload.json)
+          BUILD_TYPE=$(jq -r '.buildType // "release"' payload.json)
+          if [ -z "$ASSET_URL" ]; then
+            echo "::error::payload.url kosong"
+            exit 1
+          fi
+          rm -rf project project.zip
+          mkdir -p project
+          curl -fL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/octet-stream" -o project.zip "$ASSET_URL"
+          unzip -q project.zip -d project
+          PUBSPEC=$(find project -maxdepth 5 -type f -name pubspec.yaml | head -n 1)
+          if [ -z "$PUBSPEC" ]; then
+            echo "::error::pubspec.yaml tidak ditemukan dalam ZIP. Pastikan ini project Flutter yang valid."
+            exit 1
+          fi
+          PROJECT_ROOT=$(cd "$(dirname "$PUBSPEC")" && pwd)
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
+          echo "BUILD_TYPE=$BUILD_TYPE" >> "$GITHUB_ENV"
+          # Nama app + ikon (dari .flutterapk Nama App / .apkicon)
+          ICON_URL=$(jq -r '.iconUrl // empty' payload.json)
+          rm -f /tmp/icon_raw
+          if [ -n "$ICON_URL" ]; then
+            curl -fL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/octet-stream" -o /tmp/icon_raw "$ICON_URL" || rm -f /tmp/icon_raw
+          fi
+          jq -r '.appName // empty' payload.json > /tmp/app_name.txt
+          jq -r '.fallbackName // empty' payload.json > /tmp/fallback_name.txt
+      - name: Build APK
+        run: |
+          set -e
+          cd "$PROJECT_ROOT"
+          GENERATED=0
+          if [ ! -d android ]; then
+            echo "Folder android/ tidak ada, dibuat otomatis..."
+            GENERATED=1
+            # nama pakej Dart ikut pubspec.yaml; tak sah / kosong = 'app_build' (cara lama yang terbukti jalan)
+            PKG=$(grep -m1 -E '^name:' pubspec.yaml | sed -E 's/^name:[[:space:]]*//' | tr -d "\"' \r" || true)
+            if ! printf '%s' "$PKG" | grep -qE '^[a-z][a-z0-9_]*$'; then PKG=app_build; fi
+            if ! flutter create . --platforms=android --project-name "$PKG"; then
+              echo "::warning::flutter create gagal dengan nama $PKG, cuba app_build"
+              flutter create . --platforms=android --project-name app_build
+            fi
+          fi
+          APP_NAME=$(cat /tmp/app_name.txt 2>/dev/null || true)
+          if [ -z "$APP_NAME" ] && [ "$GENERATED" = "1" ]; then APP_NAME=$(cat /tmp/fallback_name.txt 2>/dev/null || true); fi
+          export APP_NAME GENERATED
+          # Nama + ikon: TIDAK BOLEH menggagalkan build. Kalau ralat, build diteruskan dengan ikon/nama asal.
+          # Alat gambar (Pillow / ImageMagick) dipasang kalau belum ada, supaya ikon sentiasa dapat dijana.
+          rm -f /tmp/icon_status.txt
+          if ! python3 -c "import PIL" >/dev/null 2>&1; then
+            sudo apt-get install -y -qq python3-pil >/dev/null 2>&1 || pip3 install -q --break-system-packages pillow >/dev/null 2>&1 || true
+          fi
+          if ! command -v convert >/dev/null 2>&1 && ! command -v magick >/dev/null 2>&1; then
+            sudo apt-get install -y -qq imagemagick >/dev/null 2>&1 || true
+          fi
+          python3 - <<'PY' || echo "::warning::nama/ikon gagal diterapkan, build diteruskan"
+          import os, re, glob, shutil, subprocess, tempfile
+          from xml.sax.saxutils import escape
+          name = os.environ.get("APP_NAME", "").strip()
+          generated = os.environ.get("GENERATED") == "1"
+          manifest = "android/app/src/main/AndroidManifest.xml"
+          res = "android/app/src/main/res"
+          STATUS = "/tmp/icon_status.txt"
+          def status(s):
+              print("icon-status:", s)
+              open(STATUS, "w", encoding="utf8").write(s)
+
+          # 1) label
+          try:
+              if name and os.path.exists(manifest):
+                  m = open(manifest, encoding="utf8").read()
+                  m2 = re.sub(r'android:label="[^"]*"', lambda _: 'android:label="%s"' % escape(name, {'"': "&quot;"}), m, count=1)
+                  open(manifest, "w", encoding="utf8").write(m2)
+                  print("label ->", name)
+          except Exception as e:
+              print("label gagal:", e)
+
+          # 2) ikon: jana semua saiz ke folder sementara DAHULU; hanya kalau semua berjaya baru ganti ikon asal
+          SIZES = (("mdpi", 48), ("hdpi", 72), ("xhdpi", 96), ("xxhdpi", 144), ("xxxhdpi", 192))
+          def icon_pil(raw, px, out):
+              from PIL import Image, ImageOps
+              im = Image.open(raw)
+              try: im.seek(0)
+              except Exception: pass
+              im = ImageOps.exif_transpose(im).convert("RGBA")
+              ImageOps.fit(im, (px, px), Image.LANCZOS, centering=(0.5, 0.5)).save(out, "PNG")
+          def icon_im(raw, px, out):
+              im = shutil.which("convert") or shutil.which("magick")
+              if not im: raise RuntimeError("ImageMagick tiada")
+              subprocess.check_call([im, raw + "[0]", "-background", "none", "-resize", "%dx%d^" % (px, px), "-gravity", "center", "-extent", "%dx%d" % (px, px), "PNG32:" + out])
+          def letter_pil(letter, px, out):
+              from PIL import Image, ImageDraw, ImageFont
+              im = Image.new("RGBA", (px, px), "#2563eb"); d = ImageDraw.Draw(im)
+              try: f = ImageFont.truetype("DejaVuSans-Bold.ttf", int(px * 0.57))
+              except Exception: f = ImageFont.load_default(size=int(px * 0.57))
+              d.text((px / 2, px / 2), letter, fill="white", font=f, anchor="mm"); im.save(out, "PNG")
+          def letter_im(letter, px, out):
+              im = shutil.which("convert") or shutil.which("magick")
+              if not im: raise RuntimeError("ImageMagick tiada")
+              subprocess.check_call([im, "-size", "%dx%d" % (px, px), "xc:#2563eb", "-gravity", "center", "-fill", "white", "-pointsize", str(int(px * 0.57)), "-annotate", "0", letter, "PNG32:" + out])
+          def first_ok(fns, *a):
+              err = None
+              for fn in fns:
+                  try:
+                      fn(*a)
+                      if os.path.exists(a[-1]) and os.path.getsize(a[-1]) > 0: return
+                  except Exception as e:
+                      err = e
+              raise RuntimeError("semua kaedah gagal: %s" % err)
+
+          try:
+              raw = "/tmp/icon_raw"
+              have_raw = os.path.exists(raw) and os.path.getsize(raw) > 0
+              if not (have_raw or generated):
+                  status("skipped:tiada gambar ikon sampai ke server build")
+              elif not os.path.isdir(res):
+                  status("skipped:folder res/ tiada")
+              else:
+                  tmp = tempfile.mkdtemp()
+                  letter = (re.sub(r"[^A-Za-z0-9]", "", name)[:1].upper() or "A")
+                  made = {}
+                  for d, px in SIZES:
+                      out = os.path.join(tmp, d + ".png")
+                      if have_raw: first_ok((icon_pil, icon_im), raw, px, out)
+                      else: first_ok((letter_pil, letter_im), letter, px, out)
+                      made[d] = out
+                  for f in glob.glob(res + "/mipmap-*/ic_launcher*") + glob.glob(res + "/drawable*/ic_launcher*"):
+                      try: os.remove(f)
+                      except Exception: pass
+                  for d, out in made.items():
+                      dst = "%s/mipmap-%s/ic_launcher.png" % (res, d)
+                      os.makedirs(os.path.dirname(dst), exist_ok=True)
+                      shutil.copyfile(out, dst)
+                  if os.path.exists(manifest):
+                      m = open(manifest, encoding="utf8").read()
+                      m = re.sub(r'\s+android:roundIcon="[^"]*"', "", m)
+                      if 'android:icon=' in m:
+                          m = re.sub(r'android:icon="[^"]*"', 'android:icon="@mipmap/ic_launcher"', m, count=1)
+                      else:
+                          m = m.replace("<application", '<application android:icon="@mipmap/ic_launcher"', 1)
+                      open(manifest, "w", encoding="utf8").write(m)
+                  status("custom" if have_raw else "letter")
+          except Exception as e:
+              print("icon gagal, guna ikon asal:", e)
+              status("failed:%s" % str(e)[:120].replace("\n", " "))
+          PY
+          flutter pub get
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            flutter build apk --debug
+          else
+            flutter build apk --release
+          fi
+      - name: Locate APK
+        run: |
+          set -e
+          APK_PATH=$(find "$PROJECT_ROOT/build/app/outputs/flutter-apk" -type f -name "app-*.apk" | head -n 1)
+          if [ -z "$APK_PATH" ]; then
+            echo "::error::APK tidak ditemukan setelah build."
+            exit 1
+          fi
+          echo "APK_PATH=$APK_PATH" >> "$GITHUB_ENV"
+          STATUS_PATH="$(dirname "$APK_PATH")/icon_status.txt"
+          if [ -f /tmp/icon_status.txt ]; then cp /tmp/icon_status.txt "$STATUS_PATH"; else printf 'skipped:tiada status' > "$STATUS_PATH"; fi
+          echo "STATUS_PATH=$STATUS_PATH" >> "$GITHUB_ENV"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ github.event.inputs.jobId }}
+          path: |
+            ${{ env.APK_PATH }}
+            ${{ env.STATUS_PATH }}
+          retention-days: 1
